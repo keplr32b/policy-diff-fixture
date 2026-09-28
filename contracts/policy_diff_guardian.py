@@ -1,26 +1,8 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 """
 PolicyDiff Guardian
-===================
 
 Consensus-backed material policy-change monitoring for public HTTPS pages.
-
-A policy owner:
-  1. allowlists a public HTTPS host;
-  2. registers one policy URL and plain-English guardrails;
-  3. seals a bounded baseline snapshot from that exact URL;
-  4. later re-checks the same URL.
-
-GenLayer validators fetch the current page, compare it to the sealed baseline,
-and agree on one bounded outcome:
-
-  NO_MATERIAL_CHANGE
-  MATERIAL_CHANGE
-  INCONCLUSIVE
-
-This contract is a development-network monitoring primitive. It does not
-provide legal advice, does not autonomously poll, and does not move funds.
-A check must be triggered through a transaction.
 """
 
 from genlayer import *
@@ -76,8 +58,10 @@ def parse_json_response(text: str) -> dict:
 
     if t.startswith("```"):
         t = t.strip("`")
+
         if t[:4].lower() == "json":
             t = t[4:]
+
         t = t.strip()
 
     start = t.find("{")
@@ -101,13 +85,6 @@ def normalize_text(text: str, max_len: int = MAX_SNAPSHOT_LEN) -> str:
 
 
 def snapshot_hash(text: str) -> str:
-    """
-    Deterministic snapshot identity for this development-network prototype.
-
-    This is an auditable canonical metadata representation, not a cryptographic
-    hash. A future production version can replace this with a confirmed stable
-    hash primitive or content-addressed snapshot storage.
-    """
     return canonical(
         {
             "length": len(text),
@@ -135,10 +112,6 @@ def host_of(url: str) -> str:
 
 
 def normalize_rule_csv(raw: str) -> str:
-    """
-    Accept only registered rule IDs 1..5. Normalize output to ascending,
-    comma-separated order: '1,3,5'. Empty string is valid.
-    """
     text = (raw or "").strip()
 
     if len(text) == 0:
@@ -192,13 +165,6 @@ class PolicyCheck:
 
 
 class PolicyDiffGuardian(gl.Contract):
-    """
-    Public HTTPS policy-page monitor with an owner-managed host allowlist.
-
-    Policy IDs are unique. The first successfully captured baseline is sealed:
-    it cannot be replaced by another method in this contract.
-    """
-
     owner: Address
 
     allowed_hosts: TreeMap[str, bool]
@@ -240,7 +206,10 @@ class PolicyDiffGuardian(gl.Contract):
     def _policy_index(self, policy_id: str) -> int:
         pid = (policy_id or "").strip()
 
-        require(self.policy_index_plus_one.get(pid, u256(0)) > u256(0), "unknown policy")
+        require(
+            self.policy_index_plus_one.get(pid, u256(0)) > u256(0),
+            "unknown policy",
+        )
 
         return int(self.policy_index_plus_one[pid]) - 1
 
@@ -278,7 +247,9 @@ class PolicyDiffGuardian(gl.Contract):
         check_index = len(self.checks) - 1
 
         self.latest_check_plus_one[policy_id] = u256(check_index + 1)
-        self.check_count_of[policy_id] = self.check_count_of.get(policy_id, u256(0)) + u256(1)
+        self.check_count_of[policy_id] = (
+            self.check_count_of.get(policy_id, u256(0)) + u256(1)
+        )
 
     def _validate_result(
         self,
@@ -331,7 +302,10 @@ class PolicyDiffGuardian(gl.Contract):
 
         elif s == STATUS_MATERIAL:
             require(c != CLASS_NONE, "material change needs a class")
-            require(b in (BAND_LOW, BAND_MEDIUM, BAND_HIGH), "material change needs LOW MEDIUM or HIGH")
+            require(
+                b in (BAND_LOW, BAND_MEDIUM, BAND_HIGH),
+                "material change needs LOW MEDIUM or HIGH",
+            )
             require(rules != "", "material change needs triggered rules")
 
         else:
@@ -359,7 +333,6 @@ class PolicyDiffGuardian(gl.Contract):
                 "MATERIALLY RELEVANT way against sealed monitoring guardrails.
 
 "
-
                 "IMPORTANT LIMITATIONS:
 "
                 "- This is a document-change assessment, not legal advice.
@@ -375,7 +348,6 @@ class PolicyDiffGuardian(gl.Contract):
                 "- If either document is unusable or comparison is genuinely ambiguous, return INCONCLUSIVE.
 
 "
-
                 "SEALED BASELINE POLICY:
 ---
 "
@@ -384,8 +356,7 @@ class PolicyDiffGuardian(gl.Contract):
 ---
 
 "
-
-                "CURRENT POLICY:
+                + "CURRENT POLICY:
 ---
 "
                 + current_text
@@ -393,52 +364,48 @@ class PolicyDiffGuardian(gl.Contract):
 ---
 
 "
-
-                "MONITORING GUARDRAILS:
+                + "MONITORING GUARDRAILS:
 "
                 + guardrails
                 + "
 
 "
+                + "CLASSIFICATION RULES:
+"
+                + "1 = DATA_USE: new/broader collection, sale, disclosure, sharing, profiling, "
+                + "or retention of personal or usage data.
+"
+                + "2 = USER_RIGHTS: reduced ability to access, delete, correct, export, or control data.
+"
+                + "3 = FEES: new/increased fees, subscription charges, cancellation/refund restrictions, "
+                + "withdrawal restrictions, or payment obligations.
+"
+                + "4 = ARBITRATION: new mandatory arbitration, class-action waiver, venue restriction, "
+                + "or reduced dispute-resolution rights.
+"
+                + "5 = SECURITY: material weakening of security, incident-notification, governance, "
+                + "eligibility, or service-access commitments.
 
-                "CLASSIFICATION RULES:
 "
-                "1 = DATA_USE: new/broader collection, sale, disclosure, sharing, profiling, "
-                "or retention of personal or usage data.
+                + "Return ONLY strict JSON with exactly these fields:
 "
-                "2 = USER_RIGHTS: reduced ability to access, delete, correct, export, or control data.
-"
-                "3 = FEES: new/increased fees, subscription charges, cancellation/refund restrictions, "
-                "withdrawal restrictions, or payment obligations.
-"
-                "4 = ARBITRATION: new mandatory arbitration, class-action waiver, venue restriction, "
-                "or reduced dispute-resolution rights.
-"
-                "5 = SECURITY: material weakening of security, incident-notification, governance, "
-                "eligibility, or service-access commitments.
-
-"
-
-                "Return ONLY strict JSON with exactly these fields:
-"
-                '{ "status": "NO_MATERIAL_CHANGE" or "MATERIAL_CHANGE" or "INCONCLUSIVE", '
-                '"change_class": "NONE" or "DATA_USE" or "USER_RIGHTS" or "FEES" or '
-                '"ARBITRATION" or "ELIGIBILITY" or "SECURITY" or "GOVERNANCE" or "OTHER", '
-                '"materiality_band": "NONE" or "LOW" or "MEDIUM" or "HIGH" or "UNKNOWN", '
-                '"triggered_rules_csv": "comma-separated IDs from 1,2,3,4,5 or empty", '
-                '"note": "brief evidence-grounded explanation" }
+                + '{ "status": "NO_MATERIAL_CHANGE" or "MATERIAL_CHANGE" or "INCONCLUSIVE", '
+                + '"change_class": "NONE" or "DATA_USE" or "USER_RIGHTS" or "FEES" or '
+                + '"ARBITRATION" or "ELIGIBILITY" or "SECURITY" or "GOVERNANCE" or "OTHER", '
+                + '"materiality_band": "NONE" or "LOW" or "MEDIUM" or "HIGH" or "UNKNOWN", '
+                + '"triggered_rules_csv": "comma-separated IDs from 1,2,3,4,5 or empty", '
+                + '"note": "brief evidence-grounded explanation" }
 
 '
-
-                "OUTPUT CONSTRAINTS:
+                + "OUTPUT CONSTRAINTS:
 "
-                "- NO_MATERIAL_CHANGE requires change_class NONE, materiality_band NONE, and empty triggered_rules_csv.
+                + "- NO_MATERIAL_CHANGE requires change_class NONE, materiality_band NONE, and empty triggered_rules_csv.
 "
-                "- MATERIAL_CHANGE requires a non-NONE change_class, LOW/MEDIUM/HIGH band, and one or more triggered rule IDs.
+                + "- MATERIAL_CHANGE requires a non-NONE change_class, LOW/MEDIUM/HIGH band, and one or more triggered rule IDs.
 "
-                "- INCONCLUSIVE requires change_class NONE, materiality_band UNKNOWN, and empty triggered_rules_csv.
+                + "- INCONCLUSIVE requires change_class NONE, materiality_band UNKNOWN, and empty triggered_rules_csv.
 "
-                "- Choose one primary change_class even if multiple rules trigger.
+                + "- Choose one primary change_class even if multiple rules trigger.
 "
             )
 
@@ -512,12 +479,21 @@ class PolicyDiffGuardian(gl.Contract):
 
         require(1 <= len(pid) <= MAX_POLICY_ID_LEN, "invalid policy id")
         require(1 <= len(label) <= MAX_LABEL_LEN, "invalid policy label")
-        require(80 <= len(rules) <= MAX_GUARDRAILS_LEN, "guardrails must be 80 to 2400 chars")
-        require(self.policy_index_plus_one.get(pid, u256(0)) == u256(0), "policy id already exists")
+        require(
+            80 <= len(rules) <= MAX_GUARDRAILS_LEN,
+            "guardrails must be 80 to 2400 chars",
+        )
+        require(
+            self.policy_index_plus_one.get(pid, u256(0)) == u256(0),
+            "policy id already exists",
+        )
 
         host = host_of(url)
 
-        require(self.allowed_hosts.get(host, False) is True, "host not allowed: " + host)
+        require(
+            self.allowed_hosts.get(host, False) is True,
+            "host not allowed: " + host,
+        )
 
         policy = Policy(
             policy_id=pid,
@@ -614,12 +590,18 @@ class PolicyDiffGuardian(gl.Contract):
         pid = (policy_id or "").strip()
         policy = self._read_policy(pid)
 
-        require(self.latest_check_plus_one.get(pid, u256(0)) > u256(0), "no checks yet")
+        require(
+            self.latest_check_plus_one.get(pid, u256(0)) > u256(0),
+            "no checks yet",
+        )
 
         check_index = int(self.latest_check_plus_one[pid]) - 1
         latest = self.checks[check_index]
 
-        require(latest.status == STATUS_MATERIAL, "latest result is not a material change")
+        require(
+            latest.status == STATUS_MATERIAL,
+            "latest result is not a material change",
+        )
 
         policy.acknowledged = True
 
@@ -678,7 +660,10 @@ class PolicyDiffGuardian(gl.Contract):
     def read_latest_check(self, policy_id: str) -> str:
         pid = (policy_id or "").strip()
 
-        require(self.latest_check_plus_one.get(pid, u256(0)) > u256(0), "no checks for policy")
+        require(
+            self.latest_check_plus_one.get(pid, u256(0)) > u256(0),
+            "no checks for policy",
+        )
 
         check_index = int(self.latest_check_plus_one[pid]) - 1
 
