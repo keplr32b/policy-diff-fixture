@@ -3,15 +3,7 @@
 """
 PolicyDiff Guardian
 
-A GenLayer Intelligent Contract for consensus-backed monitoring of material
-changes to registered public HTTPS policy pages.
-
-It seals one baseline snapshot for each registered policy and later compares
-the same URL against plain-English guardrails. The result is an append-only,
-consensus-backed check record.
-
-This development-network contract is not legal advice, does not autonomously
-poll the web, and does not transfer funds.
+Consensus-backed monitoring for material changes to public HTTPS policy pages.
 """
 
 from genlayer import *
@@ -67,15 +59,17 @@ def parse_json_response(text: str) -> dict:
 
     if t.startswith("```"):
         t = t.strip("`")
+
         if t[:4].lower() == "json":
             t = t[4:]
+
         t = t.strip()
 
     start = t.find("{")
     end = t.rfind("}")
 
     if start != -1 and end != -1:
-        t = t[start : end + 1]
+        t = t[start:end + 1]
 
     return json.loads(t)
 
@@ -87,7 +81,9 @@ def now_u256() -> u256:
 def normalize_text(text: str) -> str:
     raw = text if isinstance(text, str) else ""
     compact = " ".join(raw.split())
+
     require(len(compact) > 0, "empty rendered policy page")
+
     return compact[:MAX_SNAPSHOT_LEN]
 
 
@@ -107,7 +103,7 @@ def host_of(url: str) -> str:
     require(u.startswith("https://"), "only https urls allowed")
 
     rest = u[8:]
-    host = rest.split("/")[0].split("?")[0].split("#")[0]
+    host = rest.split("/").split("?").split("#")[0]
 
     require(len(host) > 0, "empty host")
     require("@" not in host, "userinfo not allowed")
@@ -130,7 +126,10 @@ def normalize_rule_csv(raw: str) -> str:
     for item in text.split(","):
         token = item.strip()
 
-        require(token in ("1", "2", "3", "4", "5"), "invalid triggered rule id")
+        require(
+            token in ("1", "2", "3", "4", "5"),
+            "invalid triggered rule id",
+        )
 
         if token not in seen:
             seen[token] = True
@@ -142,6 +141,370 @@ def normalize_rule_csv(raw: str) -> str:
 
 
 @allow_storage
+@dataclass
+class PolicyCheck:
+    policy_id: str
+    status: str
+    change_class: str
+    materiality_band: str
+    triggered_rules_csv: str
+    note: str
+    baseline_identity: str
+    current_identity: str
+    checked_at: u256
+
+
+class PolicyDiffGuardian(gl.Contract):
+    owner: Address
+
+    allowed_hosts: TreeMap[str, bool]
+
+    registered_of: TreeMap[str, bool]
+    policy_owner_of: TreeMap[str, Address]
+    policy_label_of: TreeMap[str, str]
+    policy_url_of: TreeMap[str, str]
+    policy_host_of: TreeMap[str, str]
+    guardrails_of: TreeMap[str, str]
+
+    baseline_captured_of: TreeMap[str, bool]
+    baseline_text_of: TreeMap[str, str]
+    baseline_identity_of: TreeMap[str, str]
+    created_at_of: TreeMap[str, u256]
+    baseline_captured_at_of: TreeMap[str, u256]
+
+    acknowledged_of: TreeMap[str, bool]
+    check_count_of: TreeMap[str, u256]
+    latest_check_plus_one: TreeMap[str, u256]
+
+    checks: DynArray[PolicyCheck]
+
+    def __init__(self):
+        self.owner = gl.message.sender_address
+
+    @gl.public.write
+    def allow_host(self, host: str) -> None:
+        require(gl.message.sender_address == self.owner, "only owner")
+
+        h = (host or "").strip().lower()
+
+        require(len(h) > 0, "empty host")
+        require("://" not in h, "pass host only, not url")
+        require("@" not in h, "userinfo not allowed")
+        require(not h.replace(".", "").isdigit(), "ip literal rejected")
+        require("localhost" not in h, "localhost rejected")
+        require(not h.endswith(".local"), "local tld rejected")
+
+        self.allowed_hosts[h] = True
+
+    @gl.public.write
+    def disallow_host(self, host: str) -> None:
+        require(gl.message.sender_address == self.owner, "only owner")
+
+        h = (host or "").strip().lower()
+
+        if h in self.allowed_hosts:
+            self.allowed_hosts[h] = False
+
+    def _require_registered(self, policy_id: str) -> str:
+        pid = (policy_id or "").strip()
+
+        require(1 <= len(pid) <= MAX_POLICY_ID_LEN, "invalid policy id")
+        require(
+            self.registered_of.get(pid, False) is True,
+            "unknown policy",
+        )
+
+        return pid
+
+    def _validate_result(
+        self,
+        status: str,
+        change_class: str,
+        materiality_band: str,
+        triggered_rules_csv: str,
+        note: str,
+    ) -> dict:
+        allowed_statuses = (
+            STATUS_NO_CHANGE,
+            STATUS_MATERIAL,
+            STATUS_INCONCLUSIVE,
+        )
+
+        allowed_classes = (
+            CLASS_NONE,
+            CLASS_DATA_USE,
+            CLASS_USER_RIGHTS,
+            CLASS_FEES,
+            CLASS_ARBITRATION,
+            CLASS_ELIGIBILITY,
+            CLASS_SECURITY,
+            CLASS_GOVERNANCE,
+            CLASS_OTHER,
+        )
+
+        allowed_bands = (
+            BAND_NONE,
+            BAND_LOW,
+            BAND_MEDIUM,
+            BAND_HIGH,
+            BAND_UNKNOWN,
+        )
+
+        s = (status or "").strip().upper()
+        c = (change_class or "").strip().upper()
+        b = (materiality_band or "").strip().upper()
+        rules = normalize_rule_csv(triggered_rules_csv)
+        n = (note or "").strip()[:MAX_NOTE_LEN]
+
+        require(s in allowed_statuses, "invalid status")
+        require(c in allowed_classes, "invalid change class")
+        require(b in allowed_bands, "invalid materiality band")
+
+        if s == STATUS_NO_CHANGE:
+            require(c == CLASS_NONE, "no-change class must be NONE")
+            require(b == BAND_NONE, "no-change band must be NONE")
+            require(rules == "", "no-change cannot trigger rules")
+
+        elif s == STATUS_MATERIAL:
+            require(c != CLASS_NONE, "material change needs a class")
+            require(
+                b in (BAND_LOW, BAND_MEDIUM, BAND_HIGH),
+                "material change needs LOW MEDIUM or HIGH",
+            )
+            require(rules != "", "material change needs triggered rules")
+
+        else:
+            require(c == CLASS_NONE, "inconclusive class must be NONE")
+            require(b == BAND_UNKNOWN, "inconclusive band must be UNKNOWN")
+            require(rules == "", "inconclusive cannot trigger rules")
+
+        return {
+            "status": s,
+            "change_class": c,
+            "materiality_band": b,
+            "triggered_rules_csv": rules,
+            "note": n,
+        }
+
+    def _append_check(
+        self,
+        policy_id: str,
+        status: str,
+        change_class: str,
+        materiality_band: str,
+        triggered_rules_csv: str,
+        note: str,
+        baseline_identity_value: str,
+        current_identity_value: str,
+    ) -> None:
+        record = PolicyCheck(
+            policy_id=policy_id,
+            status=status,
+            change_class=change_class,
+            materiality_band=materiality_band,
+            triggered_rules_csv=triggered_rules_csv,
+            note=note[:MAX_NOTE_LEN],
+            baseline_identity=baseline_identity_value,
+            current_identity=current_identity_value,
+            checked_at=now_u256(),
+        )
+
+        self.checks.append(record)
+
+        index = len(self.checks) - 1
+
+        self.latest_check_plus_one[policy_id] = u256(index + 1)
+        self.check_count_of[policy_id] = (
+            self.check_count_of.get(policy_id, u256(0)) + u256(1)
+        )
+
+    def _run_judgment(
+        self,
+        baseline_text: str,
+        current_text: str,
+        guardrails: str,
+        baseline_identity_value: str,
+        current_identity_value: str,
+    ) -> dict:
+        def judge() -> str:
+            prompt = (
+                "You are evaluating whether a public policy page has changed in a "
+                "MATERIALLY RELEVANT way against sealed monitoring guardrails.
+
+"
+                "IMPORTANT LIMITATIONS:
+"
+                "- This is a document-change assessment, not legal advice.
+"
+                "- Judge only the supplied baseline and current rendered text.
+"
+                "- Do not invent text, facts, obligations, or implications.
+"
+                "- Treat only a meaningful change affecting a listed guardrail as material.
+"
+                "- Formatting, headings, spelling, and non-substantive wording changes are not material.
+"
+                "- If either document is unusable or comparison is genuinely ambiguous, return INCONCLUSIVE.
+
+"
+                "SEALED BASELINE POLICY:
+---
+"
+                + baseline_text
+                + "
+---
+
+"
+                + "CURRENT POLICY:
+---
+"
+                + current_text
+                + "
+---
+
+"
+                + "MONITORING GUARDRAILS:
+"
+                + guardrails
+                + "
+
+"
+                + "CLASSIFICATION RULES:
+"
+                + "1 = DATA_USE: new/broader collection, sale, disclosure, sharing, profiling, "
+                + "or retention of personal or usage data.
+"
+                + "2 = USER_RIGHTS: reduced ability to access, delete, correct, export, or control data.
+"
+                + "3 = FEES: new/increased fees, subscription charges, cancellation/refund restrictions, "
+                + "withdrawal restrictions, or payment obligations.
+"
+                + "4 = ARBITRATION: new mandatory arbitration, class-action waiver, venue restriction, "
+                + "or reduced dispute-resolution rights.
+"
+                + "5 = SECURITY: material weakening of security, incident-notification, governance, "
+                + "eligibility, or service-access commitments.
+
+"
+                + "Return ONLY strict JSON with exactly these fields:
+"
+                + '{ "status": "NO_MATERIAL_CHANGE" or "MATERIAL_CHANGE" or "INCONCLUSIVE", '
+                + '"change_class": "NONE" or "DATA_USE" or "USER_RIGHTS" or "FEES" or '
+                + '"ARBITRATION" or "ELIGIBILITY" or "SECURITY" or "GOVERNANCE" or "OTHER", '
+                + '"materiality_band": "NONE" or "LOW" or "MEDIUM" or "HIGH" or "UNKNOWN", '
+                + '"triggered_rules_csv": "comma-separated IDs from 1,2,3,4,5 or empty", '
+                + '"note": "brief evidence-grounded explanation" }
+
+'
+                + "OUTPUT CONSTRAINTS:
+"
+                + "- NO_MATERIAL_CHANGE requires change_class NONE, materiality_band NONE, and empty triggered_rules_csv.
+"
+                + "- MATERIAL_CHANGE requires a non-NONE change_class, LOW/MEDIUM/HIGH band, and one or more triggered rule IDs.
+"
+                + "- INCONCLUSIVE requires change_class NONE, materiality_band UNKNOWN, and empty triggered_rules_csv.
+"
+                + "- Choose one primary change_class even if multiple rules trigger.
+"
+            )
+
+            raw = gl.nondet.exec_prompt(prompt)
+            data = parse_json_response(raw)
+
+            validated = self._validate_result(
+                str(data.get("status", "")),
+                str(data.get("change_class", "")),
+                str(data.get("materiality_band", "")),
+                str(data.get("triggered_rules_csv", "")),
+                str(data.get("note", "")),
+            )
+
+            return canonical(
+                {
+                    "status": validated["status"],
+                    "change_class": validated["change_class"],
+                    "materiality_band": validated["materiality_band"],
+                    "triggered_rules_csv": validated["triggered_rules_csv"],
+                    "note": validated["note"],
+                    "baseline_identity": baseline_identity_value,
+                    "current_identity": current_identity_value,
+                }
+            )
+
+        principle = (
+            "Two policy-change assessments are EQUIVALENT if and only if all "
+            "state-changing fields are identical: (1) status, (2) change_class, "
+            "(3) materiality_band, (4) triggered_rules_csv after treating it as "
+            "an unordered set of rule IDs, (5) baseline_identity, and "
+            "(6) current_identity. The note may differ in wording, detail, or style. "
+            "If any state-changing field differs, the assessments are NOT equivalent."
+        )
+
+        agreed = gl.eq_principle.prompt_comparative(judge, principle)
+        parsed = json.loads(agreed)
+
+        require(
+            str(parsed.get("baseline_identity", "")) == baseline_identity_value,
+            "baseline identity mismatch",
+        )
+
+        require(
+            str(parsed.get("current_identity", "")) == current_identity_value,
+            "current identity mismatch",
+        )
+
+        return self._validate_result(
+            str(parsed.get("status", "")),
+            str(parsed.get("change_class", "")),
+            str(parsed.get("materiality_band", "")),
+            str(parsed.get("triggered_rules_csv", "")),
+            str(parsed.get("note", "")),
+        )
+
+    @gl.public.write
+    def register_policy(
+        self,
+        policy_id: str,
+        policy_url: str,
+        policy_label: str,
+        guardrails: str,
+    ) -> None:
+        require(gl.message.sender_address == self.owner, "only owner")
+
+        pid = (policy_id or "").strip()
+        url = (policy_url or "").strip()
+        label = (policy_label or "").strip()
+        rules = (guardrails or "").strip()
+
+        require(1 <= len(pid) <= MAX_POLICY_ID_LEN, "invalid policy id")
+        require(1 <= len(label) <= MAX_LABEL_LEN, "invalid policy label")
+        require(
+            80 <= len(rules) <= MAX_GUARDRAILS_LEN,
+            "guardrails must be 80 to 2400 chars",
+        )
+        require(
+            self.registered_of.get(pid, False) is not True,
+            "policy id already exists",
+        )
+
+        host = host_of(url)
+
+        require(
+            self.allowed_hosts.get(host, False) is True,
+            "host not allowed: " + host,
+        )
+
+        self.registered_of[pid] = True
+        self.policy_owner_of[pid] = gl.message.sender_address
+        self.policy_label_of[pid] = label
+        self.policy_url_of[pid] = url
+        self.policy_host_of[pid] = host
+        self.guardrails_of[pid] = rules
+
+        self.baseline_captured_of[pid] = False
+        self.baseline_text_of[pid] = ""
+        self.baseline_identity_of[pid] = ""
+        self.created_at_of[pid] = now_u256()
         self.baseline_captured_at_of[pid] = u256(0)
 
         self.acknowledged_of[pid] = False
@@ -276,7 +639,9 @@ def normalize_rule_csv(raw: str) -> str:
                 "baseline_captured": bool(self.baseline_captured_of.get(pid, False)),
                 "baseline_identity": self.baseline_identity_of.get(pid, ""),
                 "created_at": int(self.created_at_of.get(pid, u256(0))),
-                "baseline_captured_at": int(self.baseline_captured_at_of.get(pid, u256(0))),
+                "baseline_captured_at": int(
+                    self.baseline_captured_at_of.get(pid, u256(0))
+                ),
                 "acknowledged": bool(self.acknowledged_of.get(pid, False)),
                 "checks_for_policy": int(self.check_count_of.get(pid, u256(0))),
             }
@@ -318,6 +683,7 @@ def normalize_rule_csv(raw: str) -> str:
     @gl.public.view
     def is_host_allowed(self, host: str) -> bool:
         h = (host or "").strip().lower()
+
         return self.allowed_hosts.get(h, False) is True
 
     @gl.public.view
